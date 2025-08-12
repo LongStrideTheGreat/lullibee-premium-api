@@ -23,7 +23,7 @@ export default async function handler(req, res) {
     const nowMs = Date.now();
     const pageSize = 300; // keep batches reasonable
     let processed = 0;
-    let downgrades = 0;
+    let totalDowngrades = 0;
 
     // We page through results to handle > pageSize users
     let last;
@@ -43,26 +43,30 @@ export default async function handler(req, res) {
       if (snap.empty) break;
 
       const batch = db.batch();
+      let writesInThisBatch = 0;
 
-      snap.docs.forEach((doc) => {
-        const data = doc.data() || {};
-        const alreadyFree = data.plan !== 'premium';
-        const expiry = Number(data.premiumExpiry || 0);
+      snap.docs.forEach((docSnap) => {
+        const data = docSnap.data() || {};
+        const expiry = Number(data.premiumExpiry);
 
-        if (!alreadyFree && expiry > 0 && expiry <= nowMs) {
+        // Guard: only downgrade when expiry is a valid finite number in the past
+        if (Number.isFinite(expiry) && expiry > 0 && expiry <= nowMs && data.plan === 'premium') {
           batch.set(
-            doc.ref,
+            docSnap.ref,
             {
               plan: 'free',
               lastDowngradedAt: FieldValue.serverTimestamp(),
             },
             { merge: true }
           );
-          downgrades += 1;
+          writesInThisBatch += 1;
         }
       });
 
-      if (downgrades > 0) await batch.commit();
+      if (writesInThisBatch > 0) {
+        await batch.commit();
+        totalDowngrades += writesInThisBatch;
+      }
 
       processed += snap.size;
       last = snap.docs[snap.docs.length - 1];
@@ -74,10 +78,10 @@ export default async function handler(req, res) {
       event: 'cron.expire',
       okSignature: true,
       mode: process.env.PAYSTACK_SECRET?.startsWith('sk_test_') ? 'test' : 'live',
-      summary: { processed, downgrades, at: nowMs },
+      summary: { processed, downgrades: totalDowngrades, at: nowMs },
     });
 
-    return res.status(200).json({ ok: true, processed, downgrades });
+    return res.status(200).json({ ok: true, processed, downgrades: totalDowngrades });
   } catch (err) {
     console.error('expire task error:', err);
     return res.status(200).json({ ok: false, error: 'internal' });
