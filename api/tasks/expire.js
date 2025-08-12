@@ -4,6 +4,12 @@ import { getAdmin } from "../_admin.js";
 export default async function handler(req, res) {
   if (req.method !== "POST") return res.status(405).end();
 
+  // Require a bearer secret so only Vercel cron can call this
+  if (process.env.CRON_SECRET) {
+    const ok = req.headers.authorization === `Bearer ${process.env.CRON_SECRET}`;
+    if (!ok) return res.status(401).end();
+  }
+
   try {
     const admin = getAdmin();
     const db = admin.firestore();
