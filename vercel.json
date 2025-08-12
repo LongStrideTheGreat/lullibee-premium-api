@@ -1,9 +1,5 @@
 {
   "crons": [
-    {
-      "path": "/api/tasks/expire",
-      "schedule": "*/15 * * * *"
-    }
+    { "path": "/api/tasks/expire", "schedule": "0 3 * * *" }  
   ]
 }
-
