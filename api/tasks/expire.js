@@ -1,19 +1,15 @@
 // api/tasks/expire.js
-// Downgrades users when premiumExpiry <= now.
-// Safe to run frequently; idempotent; batched writes.
-
 import { getAdmin } from '../_admin.js';
 
 export default async function handler(req, res) {
-  // Optional: protect the endpoint (recommended)
-  const okSecret =
-    process.env.CRON_SECRET &&
-    (req.headers['x-cron-secret'] === process.env.CRON_SECRET ||
-     req.query?.secret === process.env.CRON_SECRET);
+  // Optional: protect endpoint
+  const needSecret = Boolean(process.env.CRON_SECRET);
+  const valid =
+    !needSecret ||
+    req.headers['x-cron-secret'] === process.env.CRON_SECRET ||
+    req.query?.secret === process.env.CRON_SECRET;
 
-  if (process.env.CRON_SECRET && !okSecret) {
-    return res.status(401).json({ ok: false, error: 'unauthorized' });
-  }
+  if (!valid) return res.status(401).json({ ok: false, error: 'unauthorized' });
 
   try {
     const admin = getAdmin();
@@ -21,15 +17,12 @@ export default async function handler(req, res) {
     const FieldValue = admin.firestore.FieldValue;
 
     const nowMs = Date.now();
-    const pageSize = 300; // keep batches reasonable
+    const pageSize = 300;
     let processed = 0;
     let totalDowngrades = 0;
-
-    // We page through results to handle > pageSize users
     let last;
+
     do {
-      // Requires composite index:
-      // users: plan ASC, premiumExpiry ASC
       let q = db
         .collection('users')
         .where('plan', '==', 'premium')
@@ -43,48 +36,33 @@ export default async function handler(req, res) {
       if (snap.empty) break;
 
       const batch = db.batch();
-      let writesInThisBatch = 0;
+      let writes = 0;
 
       snap.docs.forEach((docSnap) => {
-        const data = docSnap.data() || {};
-        const expiry = Number(data.premiumExpiry);
-
-        // Guard: only downgrade when expiry is a valid finite number in the past
-        if (Number.isFinite(expiry) && expiry > 0 && expiry <= nowMs && data.plan === 'premium') {
+        const d = docSnap.data() || {};
+        const exp = Number(d.premiumExpiry);
+        if (Number.isFinite(exp) && exp > 0 && exp <= nowMs) {
           batch.set(
             docSnap.ref,
-            {
-              plan: 'free',
-              lastDowngradedAt: FieldValue.serverTimestamp(),
-            },
+            { plan: 'free', premiumExpiry: 0, lastDowngradedAt: FieldValue.serverTimestamp() },
             { merge: true }
           );
-          writesInThisBatch += 1;
+          writes += 1;
         }
       });
 
-      if (writesInThisBatch > 0) {
+      if (writes) {
         await batch.commit();
-        totalDowngrades += writesInThisBatch;
+        totalDowngrades += writes;
       }
 
       processed += snap.size;
       last = snap.docs[snap.docs.length - 1];
     } while (last);
 
-    // Optional: light metric
-    await db.collection('webhook_traces').add({
-      ts: admin.firestore.FieldValue.serverTimestamp(),
-      event: 'cron.expire',
-      okSignature: true,
-      mode: process.env.PAYSTACK_SECRET?.startsWith('sk_test_') ? 'test' : 'live',
-      summary: { processed, downgrades: totalDowngrades, at: nowMs },
-    });
-
     return res.status(200).json({ ok: true, processed, downgrades: totalDowngrades });
-  } catch (err) {
-    console.error('expire task error:', err);
+  } catch (e) {
+    console.error('expire task error:', e);
     return res.status(200).json({ ok: false, error: 'internal' });
   }
 }
-// hh
