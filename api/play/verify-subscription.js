@@ -1,176 +1,220 @@
 // api/play/verify-subscription.js
-// Verify a Google Play subscription token and activate Premium.
-// Schema aligns with existing Paystack flow: plan/premiumSince/premiumExpiry fields.
-// Env required:
-//   GOOGLE_PLAY_PACKAGE_NAME
-//   GOOGLE_PLAY_SA_CLIENT_EMAIL
-//   GOOGLE_PLAY_SA_PRIVATE_KEY
-// Optional:
-//   ALLOWED_SKU_PREFIX (e.g. 'lullibee_premium_')
-//   PREMIUM_DURATION_DAYS (fallback if Google expiry missing; default 30)
+// Verifies a Google Play SUBSCRIPTION and (optionally) updates Firestore.
+//
+// Body:
+// {
+//   "packageName": "com.yourcompany.lullibee",        // optional; falls back to env PLAY_PACKAGE_NAME
+//   "productId":   "lullibee_premium_monthly",        // required
+//   "purchaseToken":"<token>",                         // required
+//   "uid":         "<firebaseAuthUid>"                 // optional: if provided, we'll flip premium in Firestore
+// }
+//
+// Headers (optional):
+//   x-test-mode: "true"        -> short-circuit with a safe stub; no Firestore writes
+//   x-acknowledge: "true"      -> if not acknowledged, call purchases.subscriptions.acknowledge
 
-import { google } from "googleapis";
-import { getAdmin } from "../_admin.js";
+import { google } from 'googleapis';
 
-function isAllowedSku(productId) {
-  const prefix = process.env.ALLOWED_SKU_PREFIX;
-  if (!prefix) return true; // if not set, allow all
-  return typeof productId === "string" && productId.startsWith(prefix);
+// ---- Firebase Admin (lazy singleton) ----
+let _admin = null;
+function getAdmin() {
+  if (_admin) return _admin;
+  // Allow either FIREBASE_SERVICE_ACCOUNT (full admin JSON) or GOOGLE_SA_JSON (same object)
+  const svc =
+    process.env.FIREBASE_SERVICE_ACCOUNT ||
+    process.env.GOOGLE_SA_JSON;
+  if (!svc) {
+    throw new Error('Missing FIREBASE_SERVICE_ACCOUNT / GOOGLE_SA_JSON env');
+  }
+  // Avoid re-init if hot reloaded
+  const g = globalThis.__fbadmin || {};
+  if (!g.app) {
+    const admin = require('firebase-admin');
+    const creds = JSON.parse(svc);
+    try {
+      admin.initializeApp({
+        credential: admin.credential.cert(creds),
+      });
+    } catch (e) {
+      // ignore "already exists"
+    }
+    g.app = true;
+    g.admin = admin;
+    globalThis.__fbadmin = g;
+  }
+  _admin = globalThis.__fbadmin.admin;
+  return _admin;
 }
 
-function isActiveStateV2(subscriptionState) {
-  if (!subscriptionState) return false;
-  const v = String(subscriptionState).toUpperCase();
-  // Allow ACTIVE and IN_GRACE_PERIOD for access
-  return v.includes("ACTIVE") || v.includes("GRACE");
-}
+// ---- Google Android Publisher (lazy) ----
+let _publisher = null;
+async function getAndroidPublisher() {
+  if (_publisher) return _publisher;
+  const svc =
+    process.env.GOOGLE_SA_JSON ||
+    process.env.FIREBASE_SERVICE_ACCOUNT;
+  if (!svc) throw new Error('Missing GOOGLE_SA_JSON / FIREBASE_SERVICE_ACCOUNT env');
+  const creds = JSON.parse(svc);
 
-function pickV2ExpiryMillis(subData) {
-  const li = subData?.lineItems?.[0];
-  const expiry = li?.expiryTime; // milliseconds since epoch in string
-  if (!expiry) return null;
-  const n = Number(expiry);
-  return Number.isFinite(n) ? n : null;
-}
-
-async function getPublisher() {
-  const jwt = new google.auth.JWT({
-    email: process.env.GOOGLE_PLAY_SA_CLIENT_EMAIL,
-    key: (process.env.GOOGLE_PLAY_SA_PRIVATE_KEY || "").replace(/\\n/g, "\n"),
-    scopes: ["https://www.googleapis.com/auth/androidpublisher"],
+  const auth = new google.auth.GoogleAuth({
+    credentials: {
+      client_email: creds.client_email,
+      private_key: creds.private_key,
+    },
+    scopes: ['https://www.googleapis.com/auth/androidpublisher'],
   });
+  const client = await auth.getClient();
+  _publisher = google.androidpublisher({ version: 'v3', auth: client });
+  return _publisher;
+}
 
-  return google.androidpublisher({
-    version: "v3",
-    auth: jwt,
-  });
+function json(res, code, body) {
+  res.status(code).setHeader('content-type', 'application/json');
+  res.end(JSON.stringify(body));
 }
 
 export default async function handler(req, res) {
-  if (req.method !== "POST") return res.status(405).end();
+  if (req.method !== 'POST') return json(res, 405, { error: 'Method not allowed' });
+
+  const testMode = String(req.headers['x-test-mode'] || '').toLowerCase() === 'true';
+  const doAcknowledge = String(req.headers['x-acknowledge'] || '').toLowerCase() === 'true';
 
   try {
-    const { uid, purchaseToken, productId, packageName } = req.body || {};
-    if (!uid || !purchaseToken || !productId || !packageName) {
-      return res.status(400).json({ ok: false, error: "Missing fields (uid, purchaseToken, productId, packageName)." });
+    const {
+      packageName: bodyPackage,
+      productId,
+      purchaseToken,
+      uid,                                  // optional
+    } = (req.body || {});
+
+    const packageName =
+      bodyPackage ||
+      process.env.PLAY_PACKAGE_NAME ||
+      'com.yourcompany.lullibee';
+
+    if (!productId || !purchaseToken) {
+      return json(res, 400, { error: 'Missing productId or purchaseToken' });
     }
 
-    if (!process.env.GOOGLE_PLAY_PACKAGE_NAME) {
-      return res.status(500).json({ ok: false, error: "Missing GOOGLE_PLAY_PACKAGE_NAME" });
-    }
-    if (packageName !== process.env.GOOGLE_PLAY_PACKAGE_NAME) {
-      return res.status(400).json({ ok: false, error: "Invalid packageName." });
-    }
-    if (!isAllowedSku(productId)) {
-      return res.status(400).json({ ok: false, error: "SKU not allowed." });
-    }
-
-    const publisher = await getPublisher();
-
-    // Subscriptions v2 verify:
-    // https://developers.google.com/android-publisher/api-ref/rest/v3/purchases.subscriptionsv2/get
-    const subResp = await publisher.purchases.subscriptionsv2.get({
-      packageName,
-      token: purchaseToken,
-    });
-    const subData = subResp.data;
-
-    const state = subData?.subscriptionState; // e.g., SUBSCRIPTION_STATE_ACTIVE
-    const orderId = subData?.latestOrderId || null;
-    const googleProductId = subData?.lineItems?.[0]?.productId || productId;
-
-    if (!isActiveStateV2(state)) {
-      return res.status(200).json({
-        ok: false,
-        verified: false,
-        reason: `Subscription not active (state=${state || "UNKNOWN"})`,
-        orderId,
+    // ---- TEST SHORT-CIRCUIT (no external calls, no writes) ----
+    if (testMode) {
+      return json(res, 200, {
+        ok: true,
+        test: true,
+        packageName,
+        productId,
+        purchaseTokenPreview: purchaseToken.slice(0, 8) + '…',
+        message: 'Connectivity OK (TEST MODE). No verification performed.',
       });
     }
 
-    // Use Google's expiry when available; else fallback to N days
-    const nowMs = Date.now();
-    const googleExpiry = pickV2ExpiryMillis(subData);
-    const fallbackDays = Number(process.env.PREMIUM_DURATION_DAYS || "30");
-    const effectiveExpiryMs =
-      googleExpiry && googleExpiry > nowMs
-        ? googleExpiry
-        : nowMs + fallbackDays * 24 * 60 * 60 * 1000;
+    const publisher = await getAndroidPublisher();
 
-    // Firestore update (align with existing Paystack schema)
-    const admin = getAdmin();
-    const db = admin.firestore();
-    const FieldValue = admin.firestore.FieldValue;
+    // Verify subscription token with Google Play
+    // https://developers.google.com/android-publisher/api-ref/rest/v3/purchases.subscriptions/get
+    const { data } = await publisher.purchases.subscriptions.get({
+      packageName,
+      subscriptionId: productId,
+      token: purchaseToken,
+    });
 
-    const userRef = db.doc(`users/${uid}`);
+    // data includes fields like:
+    // purchaseState (0 purchased, 1 canceled, 2 pending),
+    // paymentState (1 pending, 2 received, 3 free trial, 4 pending deferred upgrade/downgrade),
+    // acknowledgementState (0 yet to be acknowledged, 1 acknowledged),
+    // expiryTimeMillis,
+    // autoRenewing, etc.
+    const now = Date.now();
+    const expiryMs = Number(data.expiryTimeMillis || 0);
+    const isActive = expiryMs > now && String(data.purchaseState) === '0';
 
-    // Use orderId when present, else purchaseToken, to keep idempotence in /payments
-    const reference = String(orderId || purchaseToken);
-    const payRef = db.collection("payments").doc(reference);
-
-    let alreadyProcessed = false;
-
-    await db.runTransaction(async (tx) => {
-      const paySnap = await tx.get(payRef);
-      if (paySnap.exists && paySnap.data()?.processed) {
-        alreadyProcessed = true;
-        return;
-      }
-
-      const uSnap = await tx.get(userRef);
-      const current = uSnap.exists ? uSnap.data() : {};
-      const now = Date.now();
-
-      tx.set(
-        userRef,
-        {
-          plan: "premium",
-          premiumSince: Number.isFinite(current?.premiumSince) ? current.premiumSince : now,
-          premiumExpiry: effectiveExpiryMs,
-          lastPaymentRef: reference,
-          lastPaymentAt: FieldValue.serverTimestamp(),
-          lastPaymentAmount: null,
-          lastPaymentCurrency: null,
-          source: "google_play",
-          // keep any existing email field; do not overwrite with null
-        },
-        { merge: true }
-      );
-
-      tx.set(
-        payRef,
-        {
-          uid,
-          reference,
-          status: "success",
-          source: "google_play_verify",
-          amount: null,
-          currency: null,
-          productId: googleProductId,
-          orderId,
+    // Optionally acknowledge (good hygiene; otherwise client can acknowledge)
+    if (isActive && data.acknowledgementState === 0 && doAcknowledge) {
+      try {
+        await publisher.purchases.subscriptions.acknowledge({
+          packageName,
+          subscriptionId: productId,
           token: purchaseToken,
-          processed: true,
-          processedAt: FieldValue.serverTimestamp(),
-          createdAt: FieldValue.serverTimestamp(),
-          lastEvent: "verify",
-        },
-        { merge: true }
-      );
-    });
+          requestBody: { developerPayload: 'ack-by-server' },
+        });
+      } catch (e) {
+        // Non-fatal; include info in response
+        console.warn('acknowledge failed:', e?.message || e);
+      }
+    }
 
-    return res.status(200).json({
+    // ---- Prepare response summary ----
+    const summary = {
       ok: true,
-      verified: true,
-      uid,
-      orderId,
-      productId: googleProductId,
-      subscriptionState: state,
-      expiresAt: effectiveExpiryMs,
-      alreadyProcessed,
-    });
+      verified: isActive,
+      packageName,
+      productId,
+      autoRenewing: !!data.autoRenewing,
+      expiryTimeMillis: expiryMs || null,
+      expiryIso: expiryMs ? new Date(expiryMs).toISOString() : null,
+      purchaseState: Number(data.purchaseState ?? -1),
+      paymentState: Number(data.paymentState ?? -1),
+      acknowledgementState: Number(data.acknowledgementState ?? -1),
+      kind: data.kind || null,
+      orderId: data.orderId || null,
+      linkedPurchaseToken: data.linkedPurchaseToken || null,
+    };
+
+    // ---- Firestore flip (only if uid provided) ----
+    if (uid) {
+      try {
+        const admin = getAdmin();
+        const db = admin.firestore();
+
+        const userRef = db.collection('users').doc(uid);
+        const premium = {
+          active: !!isActive,
+          source: 'google_play',
+          productId,
+          packageName,
+          autoRenewing: !!data.autoRenewing,
+          expiryTimeMillis: expiryMs || null,
+          expiryIso: summary.expiryIso,
+          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        };
+
+        // Store a copy of raw receipt fields for audit/debug
+        const receiptSnapshot = {
+          purchaseState: Number(data.purchaseState ?? -1),
+          paymentState: Number(data.paymentState ?? -1),
+          acknowledgementState: Number(data.acknowledgementState ?? -1),
+          kind: data.kind || null,
+          orderId: data.orderId || null,
+          linkedPurchaseToken: data.linkedPurchaseToken || null,
+        };
+
+        await userRef.set(
+          {
+            premium,
+            billing: {
+              googlePlay: {
+                productId,
+                packageName,
+                expiryTimeMillis: expiryMs || null,
+                autoRenewing: !!data.autoRenewing,
+                lastReceipt: receiptSnapshot,
+                lastVerifiedAt: admin.firestore.FieldValue.serverTimestamp(),
+              },
+            },
+          },
+          { merge: true }
+        );
+
+        summary.firestore = { updated: true, uid };
+      } catch (e) {
+        console.error('Firestore update failed:', e?.message || e);
+        summary.firestore = { updated: false, error: String(e) };
+      }
+    }
+
+    return json(res, 200, summary);
   } catch (err) {
-    const msg = err?.errors?.[0]?.message || err?.message || "internal_error";
-    console.error("play verify error:", msg);
-    return res.status(500).json({ ok: false, error: msg });
+    console.error('verify-subscription error:', err);
+    return json(res, 500, { error: 'VERIFY_SUBSCRIPTION_FAILED', detail: String(err) });
   }
 }
