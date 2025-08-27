@@ -1,149 +1,68 @@
-// api/tasks/expire.js
-import { getAdmin } from '../_admin.js';
+// /api/expire.js
+export const config = { runtime: 'edge' };
 
-export default async function handler(req, res) {
-  // Optional: protect endpoint (unchanged)
-  const needSecret = Boolean(process.env.CRON_SECRET);
-  const valid =
-    !needSecret ||
-    req.headers['x-cron-secret'] === process.env.CRON_SECRET ||
-    req.query?.secret === process.env.CRON_SECRET;
+function jsonResponse(status, body) {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: { 'content-type': 'application/json' },
+  });
+}
 
-  if (!valid) return res.status(401).json({ ok: false, error: 'unauthorized' });
+let adminAppPromise = null;
+async function getAdmin() {
+  if (adminAppPromise) return adminAppPromise;
+  adminAppPromise = (async () => {
+    const admin = (await import('firebase-admin')).default;
+    if (admin.apps.length) return admin;
+
+    const projectId = process.env.FIREBASE_PROJECT_ID || '';
+    const clientEmail = process.env.SA_CLIENT_EMAIL || '';
+    let privateKey = process.env.SA_PRIVATE_KEY || '';
+    if (privateKey.includes('\\n')) privateKey = privateKey.replace(/\\n/g, '\n');
+
+    admin.initializeApp({
+      credential: admin.credential.cert({
+        project_id: projectId,
+        client_email: clientEmail,
+        private_key: privateKey,
+      }),
+    });
+    return admin;
+  })();
+  return adminAppPromise;
+}
+
+export default async function handler(req) {
+  if (req.method !== 'POST') return jsonResponse(405, { ok: false, error: 'Method not allowed' });
+
+  const secret = req.headers.get('x-cron-secret') || '';
+  if (!secret || secret !== process.env.CRON_SECRET) {
+    return jsonResponse(401, { ok: false, error: 'Unauthorized' });
+  }
 
   try {
-    const admin = getAdmin();
+    const admin = await getAdmin();
     const db = admin.firestore();
-    const FieldValue = admin.firestore.FieldValue;
 
-    const nowMs = Date.now();
-    const pageSize = 300;
+    const now = Date.now();
+    const snap = await db.collection('users')
+      .where('premium.expiryTimeMillis', '<', now)
+      .where('premium.active', '==', true)
+      .get();
 
-    let processed = 0;
-    let totalDowngrades = 0;
+    const batch = db.batch();
+    snap.forEach((doc) => {
+      batch.set(doc.ref, {
+        premium: {
+          active: false,
+          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+        },
+      }, { merge: true });
+    });
 
-    // Helper to read millis from either number or Timestamp
-    const toMillis = (v) =>
-      v && typeof v.toMillis === 'function' ? v.toMillis() : (Number(v) || 0);
-
-    // Run a paginated expiry sweep for a specific field path
-    // fieldPath: 'premium.expiresAt' or 'premium.expiryTimeMillis'
-    async function sweep(fieldPath) {
-      let last = null;
-
-      // We filter users who still have premium.active === true and are expired by fieldPath
-      // NOTE: Requires a composite index: where(premium.active==true), where(fieldPath<=), orderBy(fieldPath)
-      while (true) {
-        let q = db
-          .collection('users')
-          .where('premium.active', '==', true)
-          .where(fieldPath, '<=', nowMs)
-          .orderBy(fieldPath, 'asc')
-          .limit(pageSize);
-
-        if (last) q = q.startAfter(last);
-
-        const snap = await q.get();
-        if (snap.empty) break;
-
-        const batch = db.batch();
-        let writes = 0;
-
-        for (const docSnap of snap.docs) {
-          const d = docSnap.data() || {};
-          // Compute the "best known" expiry in ms across both fields
-          const expMs = Math.max(
-            toMillis(d?.premium?.expiresAt),
-            toMillis(d?.premium?.expiryTimeMillis),
-            Number(d?.premiumExpiry) || 0 // legacy support
-          );
-
-          if (expMs > 0 && expMs <= nowMs) {
-            const update = {
-              premium: {
-                ...(d.premium || {}),
-                active: false,
-                // keep stored expiry values as-is for audit; do not erase them
-              },
-              premiumExpiry: 0, // legacy field for older clients
-              lastDowngradedAt: FieldValue.serverTimestamp(),
-            };
-
-            // Maintain legacy plan flow only if it was set to 'premium'
-            if (d.plan === 'premium') {
-              update.plan = 'free';
-            }
-
-            batch.set(docSnap.ref, update, { merge: true });
-            writes += 1;
-          }
-        }
-
-        if (writes) {
-          await batch.commit();
-          totalDowngrades += writes;
-        }
-
-        processed += snap.size;
-        last = snap.docs[snap.docs.length - 1];
-      }
-    }
-
-    // Sweep by both fields to emulate OR (users might have one or the other)
-    await sweep('premium.expiresAt');
-    await sweep('premium.expiryTimeMillis');
-
-    // Optional: final sweep for very old schema (plan/premiumExpiry) — safe to remove later
-    try {
-      let lastLegacy = null;
-      while (true) {
-        let q = db
-          .collection('users')
-          .where('plan', '==', 'premium')
-          .where('premiumExpiry', '<=', nowMs)
-          .orderBy('premiumExpiry', 'asc')
-          .limit(pageSize);
-
-        if (lastLegacy) q = q.startAfter(lastLegacy);
-        const snap = await q.get();
-        if (snap.empty) break;
-
-        const batch = db.batch();
-        let writes = 0;
-
-        for (const docSnap of snap.docs) {
-          const d = docSnap.data() || {};
-          const exp = Number(d.premiumExpiry) || 0;
-          if (exp > 0 && exp <= nowMs) {
-            batch.set(
-              docSnap.ref,
-              {
-                plan: 'free',
-                premiumExpiry: 0,
-                premium: { ...(d.premium || {}), active: false },
-                lastDowngradedAt: FieldValue.serverTimestamp(),
-              },
-              { merge: true }
-            );
-            writes += 1;
-          }
-        }
-
-        if (writes) {
-          await batch.commit();
-          totalDowngrades += writes;
-        }
-
-        processed += snap.size;
-        lastLegacy = snap.docs[snap.docs.length - 1];
-      }
-    } catch (e) {
-      // ignore legacy errors; schema may not exist
-    }
-
-    return res.status(200).json({ ok: true, processed, downgrades: totalDowngrades });
-  } catch (e) {
-    console.error('expire task error:', e);
-    return res.status(200).json({ ok: false, error: 'internal' });
+    if (!snap.empty) await batch.commit();
+    return jsonResponse(200, { ok: true, processed: snap.size });
+  } catch (err) {
+    return jsonResponse(500, { ok: false, error: err?.message || String(err) });
   }
 }
