@@ -1,14 +1,18 @@
 // /api/expire.js
-// Vercel Node.js Serverless Function (Node 18+)
+module.exports.config = { runtime: "nodejs" };
 
-const admin = require('firebase-admin');
+const admin = require("firebase-admin");
 
 function getAdmin() {
   if (!admin.apps.length) {
-    const projectId = process.env.FIREBASE_PROJECT_ID || '';
-    const clientEmail = process.env.SA_CLIENT_EMAIL || '';
-    let privateKey = process.env.SA_PRIVATE_KEY || '';
-    if (privateKey.includes('\\n')) privateKey = privateKey.replace(/\\n/g, '\n');
+    const projectId = process.env.FIREBASE_PROJECT_ID || "";
+    const clientEmail = process.env.SA_CLIENT_EMAIL || "";
+    let privateKey = process.env.SA_PRIVATE_KEY || "";
+    if (privateKey.includes("\\n")) privateKey = privateKey.replace(/\\n/g, "\n");
+
+    if (!projectId || !clientEmail || !privateKey) {
+      throw new Error("Firebase Admin env missing (FIREBASE_PROJECT_ID / SA_CLIENT_EMAIL / SA_PRIVATE_KEY)");
+    }
 
     admin.initializeApp({
       credential: admin.credential.cert({
@@ -22,11 +26,15 @@ function getAdmin() {
 }
 
 module.exports = async function handler(req, res) {
-  if (req.method !== 'POST') return res.status(405).json({ ok: false, error: 'Method not allowed' });
+  if (!["GET", "POST"].includes(req.method)) {
+    return res.status(405).json({ ok: false, error: "Method not allowed" });
+  }
 
-  const secret = req.headers['x-cron-secret'] || '';
-  if (!secret || secret !== process.env.CRON_SECRET) {
-    return res.status(401).json({ ok: false, error: 'Unauthorized' });
+  // Allow either Vercel Cron or your custom secret
+  const fromVercelCron = req.headers["x-vercel-cron"] === "1";
+  const customOk = (req.headers["x-cron-secret"] || "") === process.env.CRON_SECRET;
+  if (!fromVercelCron && !customOk) {
+    return res.status(401).json({ ok: false, error: "Unauthorized" });
   }
 
   try {
@@ -34,11 +42,14 @@ module.exports = async function handler(req, res) {
     const db = adminSdk.firestore();
     const now = Date.now();
 
+    // Expire all active subscriptions past their expiry
     const snap = await db
-      .collection('users')
-      .where('premium.active', '==', true)
-      .where('premium.expiryTimeMillis', '<', now)
+      .collection("users")
+      .where("premium.active", "==", true)
+      .where("premium.expiryTimeMillis", "<", now)
       .get();
+
+    if (snap.empty) return res.status(200).json({ ok: true, processed: 0 });
 
     const batch = db.batch();
     snap.forEach((doc) => {
@@ -54,9 +65,10 @@ module.exports = async function handler(req, res) {
       );
     });
 
-    if (!snap.empty) await batch.commit();
+    await batch.commit();
     return res.status(200).json({ ok: true, processed: snap.size });
   } catch (err) {
+    console.error("[expire] 500:", err?.message || String(err));
     return res.status(500).json({ ok: false, error: err?.message || String(err) });
   }
 };

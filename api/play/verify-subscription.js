@@ -1,16 +1,20 @@
-// /api/play/verify-subscription.js
-// Vercel Node.js Serverless Function (Node 18+)
+// Vercel Serverless (Node runtime, CommonJS)
+module.exports.config = { runtime: "nodejs" };
 
-const { google } = require('googleapis');
-const admin = require('firebase-admin');
+const { google } = require("googleapis");
+const admin = require("firebase-admin");
 
-// --- init Firebase Admin once per lambda instance ---
+// ---- Firebase Admin (singleton) ----
 function getAdmin() {
   if (!admin.apps.length) {
-    const projectId = process.env.FIREBASE_PROJECT_ID || '';
-    const clientEmail = process.env.SA_CLIENT_EMAIL || '';
-    let privateKey = process.env.SA_PRIVATE_KEY || '';
-    if (privateKey.includes('\\n')) privateKey = privateKey.replace(/\\n/g, '\n');
+    const projectId = process.env.FIREBASE_PROJECT_ID || "";
+    const clientEmail = process.env.SA_CLIENT_EMAIL || "";
+    let privateKey = process.env.SA_PRIVATE_KEY || "";
+    if (privateKey.includes("\\n")) privateKey = privateKey.replace(/\\n/g, "\n");
+
+    if (!projectId || !clientEmail || !privateKey) {
+      throw new Error("Firebase Admin env missing (FIREBASE_PROJECT_ID / SA_CLIENT_EMAIL / SA_PRIVATE_KEY)");
+    }
 
     admin.initializeApp({
       credential: admin.credential.cert({
@@ -23,54 +27,60 @@ function getAdmin() {
   return admin;
 }
 
-// --- Play Developer client (uses JWT with normalized private key) ---
+// ---- Google Play (Android Publisher v3) ----
 async function getAndroidPublisher() {
-  const email = process.env.GOOGLE_PLAY_SA_CLIENT_EMAIL || '';
-  let key = process.env.GOOGLE_PLAY_SA_PRIVATE_KEY || '';
-  if (key.includes('\\n')) key = key.replace(/\\n/g, '\n');
+  const email = process.env.GOOGLE_PLAY_SA_CLIENT_EMAIL || "";
+  let key = process.env.GOOGLE_PLAY_SA_PRIVATE_KEY || "";
+  if (key.includes("\\n")) key = key.replace(/\\n/g, "\n");
+
+  if (!email || !key) {
+    throw new Error("Google Play SA env missing (GOOGLE_PLAY_SA_CLIENT_EMAIL / GOOGLE_PLAY_SA_PRIVATE_KEY)");
+  }
 
   const jwt = new google.auth.JWT({
     email,
     key,
-    scopes: ['https://www.googleapis.com/auth/androidpublisher'],
+    scopes: ["https://www.googleapis.com/auth/androidpublisher"],
   });
 
-  return google.androidpublisher({ version: 'v3', auth: jwt });
+  // Explicitly authorize to surface auth errors clearly (401/403) instead of generic 500s
+  await jwt.authorize();
+
+  return google.androidpublisher({ version: "v3", auth: jwt });
 }
 
 module.exports = async function handler(req, res) {
-  if (req.method !== 'POST') {
-    return res.status(405).json({ ok: false, error: 'Method not allowed' });
-  }
-
-  // Plumbing check without hitting Google/Firestore
-  if (req.headers['x-test-mode'] === 'true') {
-    return res.status(200).json({ ok: true, test: true, saw: req.body || {} });
-  }
-
-  const {
-    platform = 'android',
-    packageName = process.env.GOOGLE_PLAY_PACKAGE_NAME,
-    productId,
-    purchaseToken,
-    uid, // Firebase UID (required to write entitlement)
-  } = req.body || {};
-
-  if (platform !== 'android') return res.status(400).json({ ok: false, error: 'Only Android supported here' });
-  if (!uid) return res.status(400).json({ ok: false, error: 'Missing uid' });
-  if (!packageName) return res.status(400).json({ ok: false, error: 'Missing packageName' });
-  if (!purchaseToken) return res.status(400).json({ ok: false, error: 'Missing purchaseToken' });
-
-  // Optional allowlist for SKUs
-  const allowedPrefix = process.env.ALLOWED_SKU_PREFIX;
-  if (allowedPrefix && productId && !String(productId).startsWith(allowedPrefix)) {
-    return res.status(400).json({ ok: false, error: 'SKU not allowed' });
-  }
-
   try {
+    if (req.method !== "POST") {
+      return res.status(405).json({ ok: false, error: "Method not allowed" });
+    }
+
+    // quick plumbing test
+    if (req.headers["x-test-mode"] === "true") {
+      return res.status(200).json({ ok: true, test: true, saw: req.body || {} });
+    }
+
+    const {
+      platform = "android",
+      packageName = process.env.GOOGLE_PLAY_PACKAGE_NAME,
+      productId,
+      purchaseToken,
+      uid,
+    } = req.body || {};
+
+    if (platform !== "android") return res.status(400).json({ ok: false, error: "Only Android supported" });
+    if (!uid) return res.status(400).json({ ok: false, error: "Missing uid" });
+    if (!packageName) return res.status(400).json({ ok: false, error: "Missing packageName" });
+    if (!purchaseToken) return res.status(400).json({ ok: false, error: "Missing purchaseToken" });
+
+    const allowedPrefix = process.env.ALLOWED_SKU_PREFIX;
+    if (allowedPrefix && productId && !String(productId).startsWith(allowedPrefix)) {
+      return res.status(400).json({ ok: false, error: "SKU not allowed" });
+    }
+
     const androidpublisher = await getAndroidPublisher();
 
-    // Subscriptions v2 API (preferred)
+    // Subscriptions v2 – verifies by purchase token
     const subRes = await androidpublisher.purchases.subscriptionsv2.get({
       packageName,
       token: purchaseToken,
@@ -81,7 +91,7 @@ module.exports = async function handler(req, res) {
     const expiryMs = Number(line?.expiryTime || 0);
     const active = Number.isFinite(expiryMs) && expiryMs > Date.now();
 
-    // Best-effort legacy acknowledge (no-op if already acked)
+    // Best-effort acknowledge (no-op if already acked)
     if (active && productId) {
       try {
         await androidpublisher.purchases.subscriptions.acknowledge({
@@ -91,23 +101,22 @@ module.exports = async function handler(req, res) {
           requestBody: {},
         });
       } catch (ackErr) {
-        console.log('acknowledge warning:', ackErr?.message || String(ackErr));
+        console.log("[acknowledge] warning:", ackErr?.message || String(ackErr));
       }
     }
 
-    // Write entitlement to Firestore
+    // Write entitlement
     const adminSdk = getAdmin();
     const db = adminSdk.firestore();
-
-    await db.collection('users').doc(uid).set(
+    await db.collection("users").doc(uid).set(
       {
         premium: {
           active,
-          source: 'play',
+          source: "play",
+          sku: productId || null,
           updatedAt: adminSdk.firestore.FieldValue.serverTimestamp(),
           expiresAt: expiryMs ? adminSdk.firestore.Timestamp.fromMillis(expiryMs) : null,
           expiryTimeMillis: expiryMs || null,
-          sku: productId || null,
         },
       },
       { merge: true }
@@ -115,17 +124,19 @@ module.exports = async function handler(req, res) {
 
     return res.status(200).json({
       ok: true,
-      summary: {
-        isActive: active,
-        expiryTimeMillis: expiryMs || null,
-      },
+      summary: { isActive: active, expiryTimeMillis: expiryMs || null },
+      raw: { purchaseType: data?.purchaseType || null },
     });
   } catch (err) {
-    // This is where you previously saw "DECODER routines::unsupported" under Edge
-    return res.status(500).json({
-      ok: false,
-      error: 'Verification failed',
-      details: { message: err?.message || String(err) },
-    });
+    // Classify common Google auth errors
+    const msg = err?.message || String(err);
+    if (/unauthorized|invalid_grant|not found|permission/i.test(msg)) {
+      return res.status(401).json({ ok: false, error: "Play auth error", details: msg });
+    }
+    if (/PERMISSION|forbidden|insufficient/i.test(msg)) {
+      return res.status(403).json({ ok: false, error: "Play permission error", details: msg });
+    }
+    console.error("[verify-subscription] 500:", msg);
+    return res.status(500).json({ ok: false, error: "Function_invocation_failed", details: msg });
   }
 };
