@@ -1,7 +1,6 @@
-// /api/expire.js
-module.exports.config = { runtime: "nodejs" };
+export const config = { runtime: "nodejs" };
 
-const admin = require("firebase-admin");
+import admin from "firebase-admin";
 
 function getAdmin() {
   if (!admin.apps.length) {
@@ -25,7 +24,7 @@ function getAdmin() {
   return admin;
 }
 
-module.exports = async function handler(req, res) {
+export default async function handler(req, res) {
   if (!["GET", "POST"].includes(req.method)) {
     return res.status(405).json({ ok: false, error: "Method not allowed" });
   }
@@ -42,7 +41,6 @@ module.exports = async function handler(req, res) {
     const db = adminSdk.firestore();
     const now = Date.now();
 
-    // Expire all active subscriptions past their expiry
     const snap = await db
       .collection("users")
       .where("premium.active", "==", true)
@@ -71,4 +69,4 @@ module.exports = async function handler(req, res) {
     console.error("[expire] 500:", err?.message || String(err));
     return res.status(500).json({ ok: false, error: err?.message || String(err) });
   }
-};
+}

@@ -1,7 +1,8 @@
-module.exports.config = { runtime: "nodejs" };
+// ESM + Vercel Node runtime
+export const config = { runtime: "nodejs" };
 
-const { google } = require("googleapis");
-const admin = require("firebase-admin");
+import { google } from "googleapis";
+import admin from "firebase-admin";
 
 // ---- Firebase Admin (singleton) ----
 function getAdmin() {
@@ -10,11 +11,17 @@ function getAdmin() {
     const clientEmail = process.env.SA_CLIENT_EMAIL || "";
     let privateKey = process.env.SA_PRIVATE_KEY || "";
     if (privateKey.includes("\\n")) privateKey = privateKey.replace(/\\n/g, "\n");
+
     if (!projectId || !clientEmail || !privateKey) {
       throw new Error("Firebase Admin env missing (FIREBASE_PROJECT_ID / SA_CLIENT_EMAIL / SA_PRIVATE_KEY)");
     }
+
     admin.initializeApp({
-      credential: admin.credential.cert({ project_id: projectId, client_email: clientEmail, private_key: privateKey }),
+      credential: admin.credential.cert({
+        project_id: projectId,
+        client_email: clientEmail,
+        private_key: privateKey,
+      }),
     });
   }
   return admin;
@@ -25,16 +32,28 @@ async function getAndroidPublisher() {
   const email = process.env.GOOGLE_PLAY_SA_CLIENT_EMAIL || "";
   let key = process.env.GOOGLE_PLAY_SA_PRIVATE_KEY || "";
   if (key.includes("\\n")) key = key.replace(/\\n/g, "\n");
-  if (!email || !key) throw new Error("Google Play SA env missing (GOOGLE_PLAY_SA_CLIENT_EMAIL / GOOGLE_PLAY_SA_PRIVATE_KEY)");
 
-  const jwt = new google.auth.JWT({ email, key, scopes: ["https://www.googleapis.com/auth/androidpublisher"] });
-  await jwt.authorize(); // surface auth/perm errors as 401/403
+  if (!email || !key) {
+    throw new Error("Google Play SA env missing (GOOGLE_PLAY_SA_CLIENT_EMAIL / GOOGLE_PLAY_SA_PRIVATE_KEY)");
+  }
+
+  const jwt = new google.auth.JWT({
+    email,
+    key,
+    scopes: ["https://www.googleapis.com/auth/androidpublisher"],
+  });
+
+  // Surface auth/permission issues as 401/403 instead of late 500s
+  await jwt.authorize();
+
   return google.androidpublisher({ version: "v3", auth: jwt });
 }
 
-module.exports = async function handler(req, res) {
+export default async function handler(req, res) {
   try {
-    if (req.method !== "POST") return res.status(405).json({ ok: false, error: "Method not allowed" });
+    if (req.method !== "POST") {
+      return res.status(405).json({ ok: false, error: "Method not allowed" });
+    }
 
     // plumbing test
     if (req.headers["x-test-mode"] === "true") {
@@ -63,13 +82,12 @@ module.exports = async function handler(req, res) {
 
     let active = false;
     let expiryMs = null;
-    let source = "play";
-    let kind = "subscription"; // or "product"
+    let kind = "subscription";
 
     // --- Try Subscriptions v2 ---
-    let triedSub = false;
+    let subTried = false;
     try {
-      triedSub = true;
+      subTried = true;
       const subRes = await androidpublisher.purchases.subscriptionsv2.get({
         packageName,
         token: purchaseToken,
@@ -79,7 +97,7 @@ module.exports = async function handler(req, res) {
       expiryMs = Number(line?.expiryTime || 0);
       active = Number.isFinite(expiryMs) && expiryMs > Date.now();
 
-      // Best-effort acknowledge
+      // Best-effort acknowledge (no-op if already acked)
       if (active && productId) {
         try {
           await androidpublisher.purchases.subscriptions.acknowledge({
@@ -88,29 +106,31 @@ module.exports = async function handler(req, res) {
             token: purchaseToken,
             requestBody: {},
           });
-        } catch (_) {}
+        } catch (e) {
+          console.log("[acknowledge] warning:", e?.message || String(e));
+        }
       }
-    } catch (e) {
-      // if not a subscription, fall through to products
+    } catch (_) {
+      // not a subscription? fall through to product
     }
 
     // --- Fallback: one-time Product purchase ---
-    if (!triedSub || (!active && expiryMs === 0)) {
+    if (!active) {
       try {
         const prodRes = await androidpublisher.purchases.products.get({
           packageName,
-          productId: productId || "", // productId required for products.get
+          productId: productId || "",
           token: purchaseToken,
         });
         const p = prodRes.data || {};
-        // products have purchaseState (0 purchased, 1 canceled, 2 pending)
+        // 0=purchased, 1=canceled, 2=pending
         if (p.purchaseState === 0) {
           active = true;
-          expiryMs = null; // one-time purchase, no expiry
+          expiryMs = null;
           kind = "product";
         }
       } catch (_) {
-        // ignore—will return 4xx below if nothing validated
+        // ignore; we'll return 402 below
       }
     }
 
@@ -125,9 +145,9 @@ module.exports = async function handler(req, res) {
       {
         premium: {
           active: true,
-          source,
+          source: "play",
           sku: productId || null,
-          kind, // "subscription" or "product"
+          kind, // "subscription" | "product"
           updatedAt: adminSdk.firestore.FieldValue.serverTimestamp(),
           expiresAt: expiryMs ? adminSdk.firestore.Timestamp.fromMillis(expiryMs) : null,
           expiryTimeMillis: expiryMs || null,
@@ -148,4 +168,4 @@ module.exports = async function handler(req, res) {
     console.error("[verify-subscription] 500:", msg);
     return res.status(500).json({ ok: false, error: "Function_invocation_failed", details: msg });
   }
-};
+}
