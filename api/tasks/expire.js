@@ -1,20 +1,10 @@
 // /api/expire.js
-export const config = { runtime: 'edge' };
+// Vercel Node.js Serverless Function (Node 18+)
 
-function jsonResponse(status, body) {
-  return new Response(JSON.stringify(body), {
-    status,
-    headers: { 'content-type': 'application/json' },
-  });
-}
+const admin = require('firebase-admin');
 
-let adminAppPromise = null;
-async function getAdmin() {
-  if (adminAppPromise) return adminAppPromise;
-  adminAppPromise = (async () => {
-    const admin = (await import('firebase-admin')).default;
-    if (admin.apps.length) return admin;
-
+function getAdmin() {
+  if (!admin.apps.length) {
     const projectId = process.env.FIREBASE_PROJECT_ID || '';
     const clientEmail = process.env.SA_CLIENT_EMAIL || '';
     let privateKey = process.env.SA_PRIVATE_KEY || '';
@@ -27,42 +17,46 @@ async function getAdmin() {
         private_key: privateKey,
       }),
     });
-    return admin;
-  })();
-  return adminAppPromise;
+  }
+  return admin;
 }
 
-export default async function handler(req) {
-  if (req.method !== 'POST') return jsonResponse(405, { ok: false, error: 'Method not allowed' });
+module.exports = async function handler(req, res) {
+  if (req.method !== 'POST') return res.status(405).json({ ok: false, error: 'Method not allowed' });
 
-  const secret = req.headers.get('x-cron-secret') || '';
+  const secret = req.headers['x-cron-secret'] || '';
   if (!secret || secret !== process.env.CRON_SECRET) {
-    return jsonResponse(401, { ok: false, error: 'Unauthorized' });
+    return res.status(401).json({ ok: false, error: 'Unauthorized' });
   }
 
   try {
-    const admin = await getAdmin();
-    const db = admin.firestore();
-
+    const adminSdk = getAdmin();
+    const db = adminSdk.firestore();
     const now = Date.now();
-    const snap = await db.collection('users')
-      .where('premium.expiryTimeMillis', '<', now)
+
+    const snap = await db
+      .collection('users')
       .where('premium.active', '==', true)
+      .where('premium.expiryTimeMillis', '<', now)
       .get();
 
     const batch = db.batch();
     snap.forEach((doc) => {
-      batch.set(doc.ref, {
-        premium: {
-          active: false,
-          updatedAt: admin.firestore.FieldValue.serverTimestamp(),
+      batch.set(
+        doc.ref,
+        {
+          premium: {
+            active: false,
+            updatedAt: adminSdk.firestore.FieldValue.serverTimestamp(),
+          },
         },
-      }, { merge: true });
+        { merge: true }
+      );
     });
 
     if (!snap.empty) await batch.commit();
-    return jsonResponse(200, { ok: true, processed: snap.size });
+    return res.status(200).json({ ok: true, processed: snap.size });
   } catch (err) {
-    return jsonResponse(500, { ok: false, error: err?.message || String(err) });
+    return res.status(500).json({ ok: false, error: err?.message || String(err) });
   }
-}
+};

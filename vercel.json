@@ -1,5 +1,10 @@
 {
+  "functions": {
+    "api/**.js": {
+      "runtime": "nodejs18.x"
+    }
+  },
   "crons": [
-    { "path": "/api/tasks/expire", "schedule": "0 3 * * *" }  
+    { "path": "/api/expire", "schedule": "0 3 * * *" }
   ]
 }
