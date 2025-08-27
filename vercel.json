@@ -1,9 +1,7 @@
 {
   "version": 2,
   "functions": {
-    "api/**/*.js": {
-      "runtime": "@vercel/node@2.9.13"
-    }
+    "api/**/*.js": { "runtime": "@vercel/node@2.9.13" }
   },
   "crons": [
     { "path": "/api/tasks/expire", "schedule": "0 3 * * *" }
