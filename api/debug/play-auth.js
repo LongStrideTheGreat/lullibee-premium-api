@@ -11,7 +11,7 @@ module.exports = async (req, res) => {
     const jwt = new google.auth.JWT({
       email, key, scopes: ["https://www.googleapis.com/auth/androidpublisher"],
     });
-    await jwt.authorize(); // <-- proves auth works
+    await jwt.authorize(); // proves auth+permissions
 
     res.status(200).json({ ok: true, message: "Play auth OK" });
   } catch (e) {
