@@ -6,6 +6,6 @@
     }
   },
   "crons": [
-    { "path": "/api/expire", "schedule": "0 3 * * *" }
+    { "path": "api/tasks/expire", "schedule": "0 3 * * *" }
   ]
 }
