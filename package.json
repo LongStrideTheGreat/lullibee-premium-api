@@ -2,7 +2,7 @@
   "name": "lullibee-premium-api",
   "version": "1.0.0",
   "private": true,
-  "packageManager": "npm@10.8.2",
+  "packageManager": "yarn@1.22.22",
   "engines": { "node": ">=18" },
   "dependencies": {
     "firebase-admin": "^12.7.0",
